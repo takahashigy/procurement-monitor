@@ -314,7 +314,16 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--state", default=str(Path(__file__).with_suffix(".state.json")))
     parser.add_argument("--init", action="store_true", help="initialize baseline without notifying old notices")
+    parser.add_argument("--test-notify", action="store_true", help="send a test notification and exit")
     args = parser.parse_args()
+
+    if args.test_notify:
+        send_notification(
+            "采购/招标监控测试",
+            "这是一条 PushPlus 测试消息。收到它说明 GitHub Secret 和微信通知链路已经配置成功。",
+        )
+        print("Test notification sent.")
+        return 0
 
     try:
         return check(Path(args.state), init=args.init)
