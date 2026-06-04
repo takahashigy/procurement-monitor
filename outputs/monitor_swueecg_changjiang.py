@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """
-Monitor SWUEECG purchasing notices for:
-四川省长江造林局六十周年纪念品采购项目
+Monitor procurement notices for:
+- SWUEECG Sichuan Changjiang Afforestation Bureau 60th anniversary souvenir purchase
+- CHN Energy / Dadu River Danba Hydropower Station bidding notices
 
 Notification options, in priority order:
 - WECHAT_WEBHOOK_URL: full webhook URL, receives JSON {"title": ..., "content": ...}
-- SERVERCHAN_SENDKEY: ServerChan/Server酱 sendkey
+- SERVERCHAN_SENDKEY: ServerChan sendkey
 - PUSHPLUS_TOKEN: PushPlus token
 
 First run creates a baseline and does not notify old notices unless NOTIFY_ON_INIT=1.
+Default automation behavior is intentionally quiet:
+- no change => exit 0 with no output
+- transient fetch failure => exit 0 with no output
+Use --verbose or --fail-on-fetch-error for manual debugging.
 """
 
 from __future__ import annotations
@@ -18,6 +23,7 @@ import hashlib
 import json
 import os
 import re
+import ssl
 import sys
 import time
 from html import unescape
@@ -45,10 +51,29 @@ CHNENERGY_SEARCH_URL = (
 )
 CHNENERGY_KEYWORD = "丹巴水电站"
 CHNENERGY_TITLE_KEYWORDS = ("大渡河公司", "丹巴水电站")
-DLNYZB_SEARCH_URL = "https://www.dlnyzb.com/search?kw=丹巴水电站&si=375&page=1"
+DLNYZB_SEARCH_URL = "https://www.dlnyzb.com/search?kw=%E4%B8%B9%E5%B7%B4%E6%B0%B4%E7%94%B5%E7%AB%99&si=375&page=1"
 
 
-def request_json(url: str, method: str = "GET", payload: dict[str, Any] | None = None) -> dict[str, Any]:
+def is_retryable_error(exc: Exception) -> bool:
+    if isinstance(exc, TimeoutError):
+        return True
+    if isinstance(exc, ssl.SSLError):
+        return True
+    if isinstance(exc, URLError):
+        reason = exc.reason
+        if isinstance(reason, (TimeoutError, ssl.SSLError)):
+            return True
+        return "timed out" in str(reason).lower()
+    return False
+
+
+def request_json(
+    url: str,
+    method: str = "GET",
+    payload: dict[str, Any] | None = None,
+    retries: int = 3,
+    retry_delay: float = 2.0,
+) -> dict[str, Any]:
     body = None
     headers = {
         "Client-Id": "swuee",
@@ -58,9 +83,23 @@ def request_json(url: str, method: str = "GET", payload: dict[str, Any] | None =
     if payload is not None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         headers["Content-Type"] = "application/json"
-    req = Request(url, data=body, headers=headers, method=method)
-    with urlopen(req, timeout=20) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+
+    last_error: Exception | None = None
+    for attempt in range(1, retries + 1):
+        req = Request(url, data=body, headers=headers, method=method)
+        try:
+            with urlopen(req, timeout=20) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except (HTTPError, URLError, TimeoutError, ssl.SSLError) as exc:
+            last_error = exc
+            if attempt >= retries or not is_retryable_error(exc):
+                raise
+            print(f"Request retry {attempt}/{retries - 1} after error: {exc}", file=sys.stderr)
+            time.sleep(retry_delay)
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"request failed without response: {url}")
 
 
 def compact_html(html: str) -> str:
@@ -101,11 +140,12 @@ def save_state(path: Path, state: dict[str, Any]) -> None:
     path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def fetch_records() -> list[dict[str, Any]]:
+def fetch_records(retries: int) -> list[dict[str, Any]]:
     data = request_json(
         f"{BASE_URL}/api/purchasing/search",
         method="POST",
         payload={"current": 1, "size": 20, "projectCode": PROJECT_CODE},
+        retries=retries,
     )
     if data.get("code") != 200:
         raise RuntimeError(f"search API returned: {data}")
@@ -113,15 +153,15 @@ def fetch_records() -> list[dict[str, Any]]:
     return [r for r in records if r.get("projectCode") == PROJECT_CODE or r.get("projectName") == PROJECT_NAME]
 
 
-def fetch_old_detail() -> dict[str, Any]:
+def fetch_old_detail(retries: int) -> dict[str, Any]:
     qs = urlencode({"id": OLD_NOTICE_ID, "searchType": OLD_NOTICE_TYPE, "n": time.time()})
-    data = request_json(f"{BASE_URL}/api/purchasing/detail?{qs}")
+    data = request_json(f"{BASE_URL}/api/purchasing/detail?{qs}", retries=retries)
     if data.get("code") != 200:
         raise RuntimeError(f"detail API returned: {data}")
     return data
 
 
-def fetch_chnenergy_records() -> list[dict[str, Any]]:
+def fetch_chnenergy_records(retries: int) -> list[dict[str, Any]]:
     payload = {
         "token": "",
         "pn": 0,
@@ -146,7 +186,7 @@ def fetch_chnenergy_records() -> list[dict[str, Any]]:
         "noParticiple": "0",
         "searchRange": None,
     }
-    data = request_json(CHNENERGY_SEARCH_URL, method="POST", payload=payload)
+    data = request_json(CHNENERGY_SEARCH_URL, method="POST", payload=payload, retries=retries)
     records = ((data.get("result") or {}).get("records")) or []
     filtered = []
     for record in records:
@@ -199,7 +239,7 @@ def send_notification(title: str, content: str) -> None:
         )
         return
 
-    print("No WeChat notification token configured; printing alert only.", file=sys.stderr)
+    print("No notification token configured; printing alert only.", file=sys.stderr)
     print(f"{title}\n{content}")
 
 
@@ -224,12 +264,13 @@ def load_secret(name: str) -> str:
 def format_record(record: dict[str, Any]) -> str:
     return "\n".join(
         [
-            f"- 标题：{record.get('title')}",
-            f"- 项目编号：{record.get('projectCode')}",
-            f"- 公告类型：{record.get('noticeType')} / {record.get('searchType')}",
-            f"- 发布时间：{record.get('recTime')}",
-            f"- 报名/截止：{record.get('enrollEndTime') or '-'}",
-            f"- 链接：{notice_url(record)}",
+            f"- Source: SWUEECG",
+            f"- Title: {record.get('title') or '-'}",
+            f"- Project code: {record.get('projectCode') or '-'}",
+            f"- Notice type: {record.get('noticeType') or '-'} / {record.get('searchType') or '-'}",
+            f"- Publish time: {record.get('recTime') or '-'}",
+            f"- Deadline: {record.get('enrollEndTime') or '-'}",
+            f"- Link: {notice_url(record)}",
         ]
     )
 
@@ -237,20 +278,20 @@ def format_record(record: dict[str, Any]) -> str:
 def format_chnenergy_record(record: dict[str, Any]) -> str:
     return "\n".join(
         [
-            f"- 来源：国家能源招标网",
-            f"- 标题：{clean_text(record.get('title') or '')}",
-            f"- 发布时间：{record.get('infodate') or '-'}",
-            f"- 分类：{record.get('categorynum') or '-'}",
-            f"- 链接：{chnenergy_url(record)}",
+            "- Source: CHN Energy bidding portal",
+            f"- Title: {clean_text(record.get('title') or '') or '-'}",
+            f"- Publish time: {record.get('infodate') or '-'}",
+            f"- Category: {record.get('categorynum') or '-'}",
+            f"- Link: {chnenergy_url(record)}",
         ]
     )
 
 
-def check(state_path: Path, init: bool = False) -> int:
+def check(state_path: Path, init: bool = False, retries: int = 3) -> int:
     state = load_state(state_path)
-    records = fetch_records()
-    detail = fetch_old_detail()
-    chnenergy_records = fetch_chnenergy_records()
+    records = fetch_records(retries)
+    detail = fetch_old_detail(retries)
+    chnenergy_records = fetch_chnenergy_records(retries)
     detail_hash = digest_detail(detail)
 
     known_ids = set(state.get("known_ids") or [])
@@ -281,32 +322,20 @@ def check(state_path: Path, init: bool = False) -> int:
     alerts: list[str] = []
     for record in new_records:
         title = record.get("title") or ""
-        if "终止" not in title and "异常" not in title:
-            alerts.append(format_record(record))
-        else:
-            alerts.append("发现新的终止/异常类公告：\n" + format_record(record))
+        prefix = "New exception/cancellation notice found:\n" if ("终止" in title or "异常" in title) else ""
+        alerts.append(prefix + format_record(record))
 
     if detail_changed:
-        alerts.append(f"旧详情页内容发生变化：{PAGE_URL}")
+        alerts.append(f"- Source: SWUEECG detail page\n- Title: Detail content changed\n- Link: {PAGE_URL}")
 
     for record in chnenergy_new_records:
         alerts.append(format_chnenergy_record(record))
 
     if alerts:
-        send_notification(
-            "采购/招标公告更新",
-            "\n\n".join(alerts),
-        )
+        send_notification("Procurement / bidding notice update", "\n\n".join(alerts))
         print(f"Alert sent. {len(alerts)} change(s).")
         return 2
 
-    print(
-        "No change. "
-        f"Known SWUEECG notices: {len(current_ids)}. "
-        f"Known CHN Energy notices: {len(chnenergy_current_ids)}. "
-        f"dlnyzb fallback URL: {DLNYZB_SEARCH_URL}. "
-        f"Checked at {state['last_checked_at']}."
-    )
     return 0
 
 
@@ -315,22 +344,50 @@ def main() -> int:
     parser.add_argument("--state", default=str(Path(__file__).with_suffix(".state.json")))
     parser.add_argument("--init", action="store_true", help="initialize baseline without notifying old notices")
     parser.add_argument("--test-notify", action="store_true", help="send a test notification and exit")
+    parser.add_argument("--retries", type=int, default=3, help="retry count for transient network failures")
+    parser.add_argument("--verbose", action="store_true", help="print status output even when there is no notice change")
+    parser.add_argument(
+        "--fail-on-fetch-error",
+        action="store_true",
+        help="exit with code 1 when fetch requests fail instead of suppressing transient monitor outages",
+    )
     args = parser.parse_args()
 
     if args.test_notify:
         send_notification(
-            "采购/招标监控测试",
-            "这是一条 PushPlus 测试消息。收到它说明 GitHub Secret 和微信通知链路已经配置成功。",
+            "Procurement / bidding monitor test",
+            "This is a PushPlus test message. If you received it, the GitHub Secret and notification path work.",
         )
         print("Test notification sent.")
         return 0
 
+    state_path = Path(args.state)
+
     try:
-        return check(Path(args.state), init=args.init)
-    except (HTTPError, URLError, TimeoutError, RuntimeError) as exc:
-        print(f"Monitor failed: {exc}", file=sys.stderr)
-        return 1
+        code = check(state_path, init=args.init, retries=max(args.retries, 1))
+        if code == 0 and args.verbose:
+            state = load_state(state_path)
+            print(
+                "No change. "
+                f"Known SWUEECG notices: {len(state.get('known_ids') or [])}. "
+                f"Known CHN Energy notices: {len(state.get('chnenergy_known_ids') or [])}. "
+                f"dlnyzb fallback URL: {DLNYZB_SEARCH_URL}. "
+                f"Checked at {state.get('last_checked_at') or '-'}."
+            )
+        return code
+    except (HTTPError, URLError, TimeoutError, RuntimeError):
+        if args.fail_on_fetch_error:
+            raise
+        return 0
+    except ssl.SSLError:
+        if args.fail_on_fetch_error:
+            raise
+        return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except (HTTPError, URLError, TimeoutError, RuntimeError, ssl.SSLError) as exc:
+        print(f"Monitor failed: {exc}", file=sys.stderr)
+        raise SystemExit(1)
