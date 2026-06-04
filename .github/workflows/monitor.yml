@@ -1,6 +1,12 @@
 name: Monitor procurement notices
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/monitor.yml"
+      - "outputs/monitor_swueecg_changjiang.py"
   schedule:
     - cron: "*/30 * * * *"
   workflow_dispatch:
